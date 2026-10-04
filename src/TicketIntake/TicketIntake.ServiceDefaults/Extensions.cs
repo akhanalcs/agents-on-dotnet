@@ -57,8 +57,7 @@ public static class Extensions
             {
                 metrics.AddAspNetCoreInstrumentation()
                     .AddHttpClientInstrumentation()
-                    .AddRuntimeInstrumentation()
-                    .AddMeter("Experimental.Microsoft.Extensions.AI"); // token usage, model call duration
+                    .AddRuntimeInstrumentation();
             })
             .WithTracing(tracing =>
             {
@@ -71,8 +70,7 @@ public static class Extensions
                     )
                     // Uncomment the following line to enable gRPC instrumentation (requires the OpenTelemetry.Instrumentation.GrpcNetClient package)
                     //.AddGrpcClientInstrumentation()
-                    .AddHttpClientInstrumentation()
-                    .AddSource("Experimental.Microsoft.Extensions.AI"); // one span per model call (from UseOpenTelemetry)
+                    .AddHttpClientInstrumentation();
             });
 
         builder.AddOpenTelemetryExporters();

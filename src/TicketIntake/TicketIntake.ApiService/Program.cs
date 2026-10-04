@@ -7,10 +7,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
 
 // Azure OpenAI from the AppHost's "openai" connection (keyless, DefaultAzureCredential).
-// Registers IChatClient for the "chat" deployment, with OpenTelemetry so model calls show up in the dashboard.
-builder.AddAzureOpenAIClient("openai")
-    .AddChatClient("chat")
-    .UseOpenTelemetry(configure: c => c.EnableSensitiveData = builder.Environment.IsDevelopment()); // prompts/responses in traces: dev only
+// Registers IChatClient for the "chat" deployment. Aspire already adds OpenTelemetry (one span per model call, token metrics).
+builder.AddAzureOpenAIClient("openai", settings =>
+        settings.EnableSensitiveTelemetryData = builder.Environment.IsDevelopment()) // prompts/responses in traces: dev only
+    .AddChatClient("chat");
 
 builder.Services.AddSingleton<TicketExtractor>();
 
