@@ -1,0 +1,5 @@
+{
+  "appHost": {
+    "path": "TicketIntake.AppHost/TicketIntake.AppHost.csproj"
+  }
+}
