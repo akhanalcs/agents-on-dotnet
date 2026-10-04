@@ -129,6 +129,19 @@ dotnet build src/TicketIntake/TicketIntake.sln
 aspire run --apphost src/TicketIntake/TicketIntake.AppHost # Or run it using the VScode extension
 ```
 
+```
+Aspire.Azure.AI.OpenAI 13.6.0-preview        ← you reference this
+├── Azure.AI.OpenAI 2.9.0-beta.1             ← Azure OpenAI SDK (Entra ID auth, Azure endpoints)
+│   └── OpenAI 2.14.0                        ← official OpenAI .NET SDK (the actual HTTP calls)
+├── Aspire.OpenAI                            ← AddChatClient + OpenTelemetry wiring
+└── Microsoft.Extensions.AI.OpenAI           ← adapts the SDK to IChatClient
+```
+
+So you can do this if you'd like:
+```bash
+dotnet remove src/TicketIntake/TicketIntake.ApiService package Microsoft.Extensions.AI.OpenAI
+```
+
 ### Add secrets
 Open .NET user secrets file and add these
 ```json
@@ -201,3 +214,20 @@ flowchart LR
     C --> CH["check"]
     CH --> OUT([IntakeResult])
 ```
+### 2a: what Document Intelligence reads on a ticket
+
+The AppHost provisions Document Intelligence (S0, local auth disabled, so Entra ID only; same Bicep as RagChat). A temporary endpoint shows the raw output of `prebuilt-layout` with the **KeyValuePairs** add-on (no training):
+
+```bash
+dotnet add src/TicketIntake/TicketIntake.ApiService package Azure.AI.DocumentIntelligence
+curl -k -F "image=@samples/tickets/ticket-002.png" https://apiservice-ticketintake.dev.localhost:7561/docintel-check
+```
+```json
+[{"key":"Ticket No.","value":"104733","confidence":0.998},{"key":"Date","value":"10/03/2026","confidence":0.996},{"key":"Time","value":"9:10 AM","confidence":0.996},{"key":"Driver Name","value":"R. Okafor","confidence":0.997},{"key":"Site Code","value":"SITE-017","confidence":0.995},{"key":"Tank No.","value":"8","confidence":0.853},{"key":"Net Volume (bbl)","value":"148.75","confidence":0.994},{"key":"Temperature (ºF)","value":null,"confidence":0.964},{"key":"Driver Signature","value":null,"confidence":0.998}]
+```
+
+What we learned (ticket-001 had all values right, confidence 0.97 to 0.997):
+- **The two extractors disagree on the smudged tank.** The agent said `null` (unreadable); DI read the faint ink as `"8"` with noticeably lower confidence (0.853 vs ~0.99). Neither is "the answer": this is exactly the case compare must send to a person.
+- **Confidence is per key-value pair** (how sure DI is that this label goes with this value), and it drops when the ink is faint. That gives us a threshold for review.
+- **DI can't see the signature.** A scribble isn't text, so `Driver Signature` is `null` on both tickets, signed or not. For now the signature comes from the agent only. A custom DI model has a *signature* field type that detects signed / unsigned.
+- **Labels are OCR'd too:** the form says `°F`, DI returned `ºF` (a look-alike character). Mapping by exact label text is brittle, which is one more reason for a custom model, where fields have names I define.

@@ -1,3 +1,6 @@
+using Azure;
+using Azure.AI.DocumentIntelligence;
+using Azure.Identity;
 using Microsoft.Extensions.AI;
 using TicketIntake.ApiService.Tickets;
 
@@ -11,6 +14,11 @@ builder.AddServiceDefaults();
 builder.AddAzureOpenAIClient("openai", settings =>
         settings.EnableSensitiveTelemetryData = builder.Environment.IsDevelopment()) // prompts/responses in traces: dev only
     .AddChatClient("chat");
+
+// Document Intelligence (no Aspire client integration, so registered by hand). Entra ID, no keys.
+builder.Services.AddSingleton(_ => new DocumentIntelligenceClient(
+    new Uri(builder.Configuration.GetConnectionString("docintel") ?? throw new InvalidOperationException("Missing ConnectionStrings:docintel")),
+    new DefaultAzureCredential()));
 
 builder.Services.AddSingleton<TicketExtractor>();
 builder.Services.AddSingleton<IntakeWorkflow>(); // the graph is built once; each request is its own run
@@ -35,9 +43,26 @@ string[] summaries = ["Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "
 
 app.MapGet("/", () => "API service is running. Navigate to /weatherforecast to see sample data.");
 
-// Smoke test: proves provisioning + keyless auth work. Replaced by the ticket endpoint in step 1b.
+// Smoke test: proves provisioning + keyless auth work.
 app.MapGet("/model-check", async (IChatClient chat) =>
     (await chat.GetResponseAsync("Reply with exactly: model is reachable")).Text);
+
+// Step 2a check: what Document Intelligence reads on a ticket (key-value pairs + confidence), before we map it to a Ticket.
+app.MapPost("/docintel-check", async (IFormFile image, DocumentIntelligenceClient docIntel, CancellationToken cancellationToken) =>
+{
+    using var buffer = new MemoryStream();
+    await image.CopyToAsync(buffer, cancellationToken);
+
+    // prebuilt-layout: OCR + layout, no training. The KeyValuePairs add-on pairs form labels with what's written next to them.
+    AnalyzeDocumentOptions options = new("prebuilt-layout", BinaryData.FromBytes(buffer.ToArray()))
+    {
+        Features = { DocumentAnalysisFeature.KeyValuePairs }
+    };
+    Operation<AnalyzeResult> operation = await docIntel.AnalyzeDocumentAsync(WaitUntil.Completed, options, cancellationToken);
+
+    return operation.Value.KeyValuePairs.Select(kv => new { Key = kv.Key.Content, Value = kv.Value?.Content, kv.Confidence });
+})
+.DisableAntiforgery();
 
 // Upload a ticket photo, run it through the intake workflow, get the result as JSON.
 app.MapPost("/tickets/intake", async (IFormFile image, IntakeWorkflow workflow, CancellationToken cancellationToken) =>
