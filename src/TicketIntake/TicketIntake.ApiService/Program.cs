@@ -1,7 +1,18 @@
+using Microsoft.Extensions.AI;
+using TicketIntake.ApiService.Tickets;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add service defaults & Aspire client integrations.
 builder.AddServiceDefaults();
+
+// Azure OpenAI from the AppHost's "openai" connection (keyless, DefaultAzureCredential).
+// Registers IChatClient for the "chat" deployment, with OpenTelemetry so model calls show up in the dashboard.
+builder.AddAzureOpenAIClient("openai")
+    .AddChatClient("chat")
+    .UseOpenTelemetry(configure: c => c.EnableSensitiveData = builder.Environment.IsDevelopment()); // prompts/responses in traces: dev only
+
+builder.Services.AddSingleton<TicketExtractor>();
 
 // Add services to the container.
 builder.Services.AddProblemDetails();
@@ -22,6 +33,24 @@ if (app.Environment.IsDevelopment())
 string[] summaries = ["Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"];
 
 app.MapGet("/", () => "API service is running. Navigate to /weatherforecast to see sample data.");
+
+// Smoke test: proves provisioning + keyless auth work. Replaced by the ticket endpoint in step 1b.
+app.MapGet("/model-check", async (IChatClient chat) =>
+    (await chat.GetResponseAsync("Reply with exactly: model is reachable")).Text);
+
+// Upload a ticket photo, get the extracted fields back as JSON.
+app.MapPost("/tickets/extract", async (IFormFile image, TicketExtractor extractor, CancellationToken cancellationToken) =>
+{
+    // Only images go to the model (untrusted input: check the type before spending tokens on it)
+    if (!image.ContentType.StartsWith("image/"))
+        return Results.BadRequest("Upload an image (PNG or JPEG).");
+
+    using var buffer = new MemoryStream();
+    await image.CopyToAsync(buffer, cancellationToken);
+    Ticket ticket = await extractor.ExtractAsync(buffer.ToArray(), image.ContentType, cancellationToken);
+    return Results.Ok(ticket);
+})
+.DisableAntiforgery(); // called by the Web app and curl, not a browser form, so there's no antiforgery token
 
 app.MapGet("/weatherforecast", () =>
 {

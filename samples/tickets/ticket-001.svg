@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="700" viewBox="0 0 1000 700">
+  <!-- Fictional sample. Printed form in Helvetica, handwriting in Noteworthy / Marker Felt (macOS fonts). -->
+  <rect width="1000" height="700" fill="#f7f3e8"/>
+  <rect x="30" y="30" width="940" height="640" fill="none" stroke="#333" stroke-width="3"/>
+
+  <g font-family="Helvetica" fill="#222">
+    <text x="60" y="85" font-size="34" font-weight="bold">ACME HAULING CO.</text>
+    <text x="60" y="115" font-size="18">Field Delivery Ticket · FOR TRAINING USE ONLY · NOT A REAL TICKET</text>
+    <text x="700" y="85" font-size="20">Ticket No.</text>
+    <text x="700" y="120" font-size="34" fill="#b22222" font-family="Courier" font-weight="bold">104732</text>
+  </g>
+  <line x1="30" y1="140" x2="970" y2="140" stroke="#333" stroke-width="2"/>
+
+  <!-- Form labels and boxes -->
+  <g font-family="Helvetica" font-size="18" fill="#222">
+    <text x="60" y="190">Date</text>
+    <text x="520" y="190">Time</text>
+    <text x="60" y="280">Driver Name</text>
+    <text x="60" y="370">Site Code</text>
+    <text x="520" y="370">Tank No.</text>
+    <text x="60" y="460">Net Volume (bbl)</text>
+    <text x="520" y="460">Temperature (°F)</text>
+    <text x="60" y="580">Driver Signature</text>
+  </g>
+  <g fill="none" stroke="#888" stroke-width="1.5">
+    <rect x="60" y="200" width="420" height="50"/>
+    <rect x="520" y="200" width="420" height="50"/>
+    <rect x="60" y="290" width="880" height="50"/>
+    <rect x="60" y="380" width="420" height="50"/>
+    <rect x="520" y="380" width="420" height="50"/>
+    <rect x="60" y="470" width="420" height="50"/>
+    <rect x="520" y="470" width="420" height="50"/>
+    <rect x="60" y="590" width="420" height="60"/>
+  </g>
+
+  <!-- Handwritten values, slightly rotated like real pen entries -->
+  <g fill="#1a2a8a" font-family="Noteworthy" font-size="30">
+    <text x="80" y="238" transform="rotate(-1 80 238)">10/02/2026</text>
+    <text x="540" y="238" transform="rotate(1 540 238)">2:45 PM</text>
+    <text x="80" y="328" transform="rotate(-0.5 80 328)">J. Martinez</text>
+    <text x="80" y="418" font-family="Marker Felt" transform="rotate(1 80 418)">SITE-042</text>
+    <text x="540" y="418" transform="rotate(-1 540 418)">3</text>
+    <text x="80" y="508" transform="rotate(0.8 80 508)">162.40</text>
+    <text x="540" y="508" transform="rotate(-0.7 540 508)">68</text>
+  </g>
+  <!-- Signature scribble -->
+  <path d="M80 630 C 100 595, 120 650, 140 615 S 175 600, 190 630 S 230 640, 250 605 L 270 632 C 290 610, 320 615, 360 620"
+        fill="none" stroke="#1a2a8a" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

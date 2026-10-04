@@ -99,6 +99,7 @@ flowchart LR
 
 ## Build it
 ```bash
+# Scaffolded with the Aspire starter (Web + ApiService + AppHost + ServiceDefaults)
 aspire new aspire-starter --name TicketIntake --output src/TicketIntake --suppress-agent-init
 Use *.dev.localhost URLs [y/N]: y
 ✅ Using *.dev.localhost URLs for local development.
@@ -115,17 +116,55 @@ aspire add azure-cognitiveservices --apphost src/TicketIntake/TicketIntake.AppHo
 
 # 2. Client packages (ApiService only)
 dotnet add src/TicketIntake/TicketIntake.ApiService package Microsoft.Agents.AI.Workflows
-dotnet add src/TicketIntake/TicketIntake.ApiService package Aspire.Azure.AI.OpenAI
+dotnet add src/TicketIntake/TicketIntake.ApiService package Aspire.Azure.AI.OpenAI --prerelease
 dotnet add src/TicketIntake/TicketIntake.ApiService package Microsoft.Extensions.AI.OpenAI
 dotnet add src/TicketIntake/TicketIntake.ApiService package Azure.Identity
 
 # 3. Azure secrets (AppHost)
 dotnet user-secrets --project src/TicketIntake/TicketIntake.AppHost set Azure:SubscriptionId <sub-id>
-dotnet user-secrets --project src/TicketIntake/TicketIntake.AppHost set Azure:TenantId 9d7f6902-2a61-4363-964c-c364b9eaf716
+dotnet user-secrets --project src/TicketIntake/TicketIntake.AppHost set Azure:TenantId <tenant-id>
 
 # 4. Build, then run the starter once
 dotnet build src/TicketIntake/TicketIntake.sln
-aspire run --apphost src/TicketIntake/TicketIntake.AppHost
+aspire run --apphost src/TicketIntake/TicketIntake.AppHost # Or run it using the VScode extension
 ```
 
+### Add secrets
+Open .NET user secrets file and add these
+```json
+{
+  "Azure:TenantId": "...",
+  "Azure:SubscriptionId": "..."
+}
+```
 
+### Run it
+
+First run provisions `rg-agents-dev-eastus2` with Azure OpenAI and a `chat` deployment (`gpt-5-mini`, GlobalStandard). Check it: open `/model-check` on `apiservice` from the dashboard.
+
+
+## Step 1: one extraction agent
+
+A multimodal agent reads a ticket photo and returns a typed `Ticket` (structured output).
+
+![Fictional sample ticket](samples/tickets/ticket-001.png)
+
+```bash
+curl -k -F "image=@samples/tickets/ticket-001.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/extract
+```
+```json
+{"ticketNumber":"104732","pickupTime":"2026-10-02T14:45:00","driverName":"J. Martinez","siteCode":"SITE-042","tankNumber":"3","volumeBarrels":162.4,"temperatureF":68,"driverSigned":true}
+```
+
+All 8 fields correct. The dashboard's **Traces** show the model call with its token usage (and, in Development only, the prompt and the JSON schema sent to the model).
+
+Read the code in this order:
+1. [`Ticket.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/Ticket.cs): the shape. Nullable = "unreadable, don't guess"; `[Description]`s become part of the JSON schema.
+2. [`TicketExtractor.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/TicketExtractor.cs): `AsAIAgent` + `RunAsync<Ticket>` with a text + image message.
+3. [`Program.cs`](src/TicketIntake/TicketIntake.ApiService/Program.cs): keyless `IChatClient` registration and `POST /tickets/extract`.
+4. [`AppHost.cs`](src/TicketIntake/TicketIntake.AppHost/AppHost.cs): Azure OpenAI + `chat` deployment, referenced by `apiservice` only.
+
+Why:
+- **Structured output** instead of parsing text: the model is held to `Ticket`'s JSON schema, and the result is a typed object the rest of the workflow can compare and validate in plain C#.
+- **Prompt injection**: the image is untrusted. The instructions say to treat it as data, and the schema limits what the model can return to `Ticket` fields.
+- Code changes need an `aspire run` restart (a running app keeps serving the old build; we hit a 404 because of that).
