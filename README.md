@@ -142,29 +142,62 @@ Open .NET user secrets file and add these
 
 First run provisions `rg-agents-dev-eastus2` with Azure OpenAI and a `chat` deployment (`gpt-5-mini`, GlobalStandard). Check it: open `/model-check` on `apiservice` from the dashboard.
 
+## Step 1: one extraction agent, inside a workflow
 
-## Step 1: one extraction agent
+A multimodal agent reads a ticket photo into a typed `Ticket` (structured output). A plain C# step flags what a person must check.
 
-A multimodal agent reads a ticket photo and returns a typed `Ticket` (structured output).
+```mermaid
+flowchart LR
+    IN([TicketImage]) --> E["extract<br/>agent"]
+    E -->|Ticket| C["check<br/>plain C#"]
+    C --> OUT([IntakeResult])
+```
 
-![Fictional sample ticket](samples/tickets/ticket-001.png)
+| Fictional ticket-001 | Fictional ticket-002 (smudged tank, no temperature, unsigned) |
+|---|---|
+| ![ticket-001](samples/tickets/ticket-001.png) | ![ticket-002](samples/tickets/ticket-002.png) |
 
+Restart `aspire` and run
 ```bash
-curl -k -F "image=@samples/tickets/ticket-001.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/extract
+curl -k -F "image=@samples/tickets/ticket-001.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/intake
 ```
 ```json
-{"ticketNumber":"104732","pickupTime":"2026-10-02T14:45:00","driverName":"J. Martinez","siteCode":"SITE-042","tankNumber":"3","volumeBarrels":162.4,"temperatureF":68,"driverSigned":true}
+{"ticket":{"ticketNumber":"104732","pickupTime":"2026-10-02T14:45:00","driverName":"J. Martinez","siteCode":"SITE-042","tankNumber":"3","volumeBarrels":162.40,"temperatureF":68,"driverSigned":true},"needsReview":[]}
+```
+```bash
+curl -k -F "image=@samples/tickets/ticket-002.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/intake
+```
+```json
+{"ticket":{"ticketNumber":"104733","pickupTime":"2026-10-03T09:10:00","driverName":"R. Okafor","siteCode":"SITE-017","tankNumber":null,"volumeBarrels":148.75,"temperatureF":null,"driverSigned":false},"needsReview":["TankNumber","TemperatureF","DriverSigned"]}
 ```
 
-All 8 fields correct. The dashboard's **Traces** show the model call with its token usage (and, in Development only, the prompt and the JSON schema sent to the model).
+The smudged tank number came back `null`, not a guess. The dashboard's **Traces** show the workflow and, inside it, the model call; click the sparkle icon on the `chat` span to see the conversation and token usage (prompt content in Development only).
 
 Read the code in this order:
 1. [`Ticket.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/Ticket.cs): the shape. Nullable = "unreadable, don't guess"; `[Description]`s become part of the JSON schema.
 2. [`TicketExtractor.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/TicketExtractor.cs): `AsAIAgent` + `RunAsync<Ticket>` with a text + image message.
-3. [`Program.cs`](src/TicketIntake/TicketIntake.ApiService/Program.cs): keyless `IChatClient` registration and `POST /tickets/extract`.
-4. [`AppHost.cs`](src/TicketIntake/TicketIntake.AppHost/AppHost.cs): Azure OpenAI + `chat` deployment, referenced by `apiservice` only.
+3. [`IntakeWorkflow.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/IntakeWorkflow.cs): two executors, one edge, built once, run with `InProcessExecution.Concurrent`.
+4. [`Program.cs`](src/TicketIntake/TicketIntake.ApiService/Program.cs): keyless `IChatClient` registration and `POST /tickets/intake`.
+5. [`AppHost.cs`](src/TicketIntake/TicketIntake.AppHost/AppHost.cs): Azure OpenAI + `chat` deployment, referenced by `apiservice` only.
 
 Why:
-- **Structured output** instead of parsing text: the model is held to `Ticket`'s JSON schema, and the result is a typed object the rest of the workflow can compare and validate in plain C#.
+- **Structured output** instead of parsing text: the model is held to `Ticket`'s JSON schema, and the result is a typed object the rest of the workflow can check in plain C#.
+- **Only the reading is an LLM call.** `check` is plain C#: deterministic, free, unit-testable.
 - **Prompt injection**: the image is untrusted. The instructions say to treat it as data, and the schema limits what the model can return to `Ticket` fields.
+- **One workflow, many concurrent runs.** A `Workflow` is a blueprint (executors + edges). Each run gets its own runner: message queue, state, events. By default a workflow allows one run at a time, because executor objects might hold per-run data. Ours are stateless and marked `declareCrossRunShareable: true`, so `InProcessExecution.Concurrent` lets every request share them. Like DI: shareable executors are singletons; factory-registered executors are scoped (a new one per run).
+- **Telemetry:** Aspire's `AddChatClient` already traces model calls; adding `UseOpenTelemetry` again doubled every span.
 - Code changes need an `aspire run` restart (a running app keeps serving the old build; we hit a 404 because of that).
+
+## Step 2: a second extractor in parallel (in progress)
+
+Fan-out / fan-in: both extractors run at the same time, and `compare` waits for both.
+
+```mermaid
+flowchart LR
+    IN([TicketImage]) --> A["extract-llm<br/>agent"]
+    IN --> B["extract-docintel<br/>Document Intelligence"]
+    A --> C["compare<br/>field by field"]
+    B --> C
+    C --> CH["check"]
+    CH --> OUT([IntakeResult])
+```

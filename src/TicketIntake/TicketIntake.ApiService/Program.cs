@@ -13,6 +13,7 @@ builder.AddAzureOpenAIClient("openai", settings =>
     .AddChatClient("chat");
 
 builder.Services.AddSingleton<TicketExtractor>();
+builder.Services.AddSingleton<IntakeWorkflow>(); // the graph is built once; each request is its own run
 
 // Add services to the container.
 builder.Services.AddProblemDetails();
@@ -38,8 +39,8 @@ app.MapGet("/", () => "API service is running. Navigate to /weatherforecast to s
 app.MapGet("/model-check", async (IChatClient chat) =>
     (await chat.GetResponseAsync("Reply with exactly: model is reachable")).Text);
 
-// Upload a ticket photo, get the extracted fields back as JSON.
-app.MapPost("/tickets/extract", async (IFormFile image, TicketExtractor extractor, CancellationToken cancellationToken) =>
+// Upload a ticket photo, run it through the intake workflow, get the result as JSON.
+app.MapPost("/tickets/intake", async (IFormFile image, IntakeWorkflow workflow, CancellationToken cancellationToken) =>
 {
     // Only images go to the model (untrusted input: check the type before spending tokens on it)
     if (!image.ContentType.StartsWith("image/"))
@@ -47,8 +48,8 @@ app.MapPost("/tickets/extract", async (IFormFile image, TicketExtractor extracto
 
     using var buffer = new MemoryStream();
     await image.CopyToAsync(buffer, cancellationToken);
-    Ticket ticket = await extractor.ExtractAsync(buffer.ToArray(), image.ContentType, cancellationToken);
-    return Results.Ok(ticket);
+    IntakeResult result = await workflow.RunAsync(new TicketImage(buffer.ToArray(), image.ContentType), cancellationToken);
+    return Results.Ok(result);
 })
 .DisableAntiforgery(); // called by the Web app and curl, not a browser form, so there's no antiforgery token
 
