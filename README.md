@@ -46,37 +46,52 @@ Drivers fill in paper tickets by hand (ticket number, driver, site, tank, volume
 
 ```mermaid
 flowchart LR
-    UP["Web<br/>upload page"] -->|image| BL[("Blob<br/>tickets")]
-    UP -->|ticket id| Q1[["Service Bus<br/>tickets"]]
-    Q1 --> L
+    SRC["Field app / scanner"] -->|1 upload photo| BL[("Blob Storage<br/>tickets")]
+    BL -->|2 BlobCreated| EG["Event Grid"]
+    EG -->|3 event| Q[["Service Bus queue<br/>tickets"]]
+    Q -->|4 peek-lock| P
 
-    subgraph RUN["ApiService: intake workflow, one short run per ticket"]
-        L["Load image"] --> XA["Extractor A<br/>LLM vision agent"]
-        L --> XB["Extractor B<br/>Document Intelligence"]
-        XA --> CMP["Compare<br/>field by field"]
-        XB --> CMP
-        CMP --> V["Validate<br/>rules + lookup tools"]
-        V -->|valid| SV["Save<br/>idempotent upsert"]
-        V -->|needs review| RV["Create review"]
+    subgraph API["ApiService"]
+        P["Queue processor<br/>MaxConcurrentCalls"] --> S
+        subgraph WF["Intake workflow: one short run per ticket"]
+            S["start<br/>load image"] -->|fan-out| A["extract-llm<br/>LLM vision agent"]
+            S -->|fan-out| B["extract-docintel<br/>Document Intelligence"]
+            A -->|fan-in| C["compare<br/>both agree?"]
+            B --> C
+            C --> V["validate<br/>ranges + reference data"]
+            V --> SV["save<br/>upsert, the run's output"]
+        end
+        R["Review API<br/>same rules"]
     end
 
-    SV --> DB[("Oracle<br/>tickets")]
-    RV --> DB
-    RV --> Q2[["Service Bus<br/>ticket-reviews"]]
-    Q2 --> HR["Web<br/>reviews page"]
-    HR -->|corrected ticket| Q3[["Service Bus<br/>tickets-reviewed"]]
-    Q3 --> SV2["Save<br/>same code"]
-    SV2 --> DB
+    SV --> DB[("Database<br/>Accepted / NeedsReview")]
+    Q -.->|failed N times| DLQ[["Dead-letter queue"]]
+    DB -->|NeedsReview = inbox| UI["Web: reviews page<br/>photo + form"]
+    UI -->|corrected values| R
+    R -->|Accepted| DB
 ```
 
-### Design decisions (interview notes)
+What runs today vs. what production adds (each placeholder sits behind one class, so swapping it doesn't touch the workflow):
+
+| Piece | Today | Production |
+|---|---|---|
+| Trigger | `POST /tickets/intake` (upload) | Blob upload → Event Grid → Service Bus queue → queue processor |
+| Image | in the request, kept in the run's state | Blob Storage; the workflow input is the blob name |
+| Storage | in-memory `TicketStore` | database (Oracle / SQL), upsert keyed by blob name |
+| Reference data | in-memory sites and tanks | database tables |
+| Review | API endpoints | Blazor reviews page on top of the same endpoints |
+| Extractor B | `prebuilt-layout` key-value pairs | custom Document Intelligence model |
+
+### Design decisions
 
 - **Two apps, from the [Aspire starter](https://aspire.dev/get-started/first-app/?aspire-lang=csharp).** `Web` (Blazor) has the upload and reviews pages and holds **no AI credentials**. `ApiService` runs the workflow and is the only app with roles on Azure OpenAI, Document Intelligence and the database (least privilege). A burst of tickets loads the worker, not the page reviewers use, and a crashed run doesn't take the UI down.
 
 - **One run per ticket, and it's short (seconds).** Tickets don't wait on each other. A Service Bus processor runs them, and its `MaxConcurrentCalls` caps how many run in parallel. That cap is also my cost and rate-limit control (Azure OpenAI tokens per minute).
-- **A review ends the run; the run doesn't pause.** A human review takes hours. The framework *could* pause the run: `RequestPort` + checkpoint, then resume later, with nothing held in memory. But I'd need a checkpoint store, and in-flight checkpoints can break when I deploy a new version of the workflow. The state a reviewer needs is small (both extractions, plus which fields disagree), and it belongs in a `reviews` table anyway, for audit. So "needs review" is **data + a message**, and the reviewer's answer starts a small new step that reuses the same Save code.
+- **A review ends the run; the run doesn't pause.** A human review takes hours. The framework *could* pause the run: `RequestPort` + checkpoint, then resume later, with nothing held in memory. But I'd need a checkpoint store, and in-flight checkpoints can break when I deploy a new version of the workflow. The state a reviewer needs is small (both readings, plus which fields failed and why), and it belongs in the database anyway, for audit. So `save` writes the ticket with status **NeedsReview**, and the run is done.
+- **Reviewers work from a table, not a queue.** A queue is for machines: each message is processed once and removed; you can't browse it or reopen a ticket. Reviewers need an inbox they can sort and come back to, so the inbox is `status = NeedsReview` in the database. A Service Bus message is optional, only to notify someone (Teams, email). The reviewer sees the original photo (served through the API, so the Web app holds no storage credentials) next to a form with both readings on each disputed field; on approve, the API runs the **same rules** and saves the values as final. What the machines read and what the person approved are stored separately (audit).
   - When I *would* use `RequestPort`: short, interactive approvals, such as a user approving a tool call in a chat, or a long multi-step run whose state is expensive to rebuild.
-- **Reliability without checkpoints.** Service Bus uses peek-lock: the message is completed only after the run succeeds. If the process crashes, the message comes back and the whole run is retried. That's safe because Save is an **upsert by ticket number** (idempotent). After N failed attempts, the message goes to the **dead-letter queue** for a person to look at.
+- **Trigger: Blob → Event Grid → Service Bus → processor, not Event Grid → API.** Event Grid could call the API directly (webhook), but a queue in between gives **buffering** (a burst of 500 uploads waits instead of overloading the API), **backpressure** (`MaxConcurrentCalls` caps parallel runs, which is also my Azure OpenAI rate-limit and cost control), retries and a **dead-letter queue**. An Azure Function with a Service Bus trigger is an equally good host for the processor.
+- **Reliability without checkpoints.** Service Bus uses peek-lock: the message is completed only after `save` succeeds. If the process crashes, the message comes back and the whole run is retried; runs are seconds long, so redoing one is cheap. Event Grid and Service Bus both deliver **at least once**, so `save` is an **upsert keyed by blob name** (idempotent): processing the same upload twice gives one ticket. After N failed attempts, the message goes to the **dead-letter queue** for a person to look at.
 - **Two different extractors as a cross-check.** Fields where both agree are high confidence; disagreements get validated or reviewed. Two extractors only catch each other's mistakes if they fail *differently*: an LLM can fill in a plausible guess for a blurry digit, while OCR misreads characters but doesn't invent values. So:
   - **A: LLM vision agent** (`gpt-5-mini`). Reads messy handwriting using context, returns a typed `Ticket`.
   - **B: [Azure Document Intelligence](https://learn.microsoft.com/azure/ai-services/document-intelligence/overview) custom extraction model**, trained on labeled sample tickets (at least 5). It's a trained, non-generative model, so it's a truly independent second opinion. It gives **per-field confidence** (so "needs review" is a threshold) and **bounding boxes** (so the reviewer sees the crop of the image next to each disputed field, like page citations in RAG). Until the model is trained, `prebuilt-layout` key-value pairs is the stand-in.
@@ -89,13 +104,13 @@ flowchart LR
 
 ### Build steps
 
-1. Workflow with one extractor: local image → `Ticket` (structured output).
-2. Image from Blob (Azurite) + extractor B (Document Intelligence) in parallel (fan-out/fan-in) + compare.
-3. Validation: rules + read-only lookup tools.
-4. Save to Oracle (idempotent upsert).
-5. Service Bus intake + review queue + dead-letter queue.
-6. Evaluation: a golden set of tickets, with per-field accuracy.
-7. Observability: Aspire dashboard traces + DevUI.
+1. ✅ One extraction agent inside a workflow: image → typed `Ticket` (structured output).
+2. ✅ Document Intelligence in parallel (fan-out / fan-in) + compare.
+3. ✅ Validate (ranges + reference data) + save (in-memory placeholder) + review API.
+4. Real storage: Blob for images, database for tickets, upsert keyed by blob name.
+5. Trigger: Event Grid → Service Bus → queue processor, with the dead-letter queue.
+6. Reviews page (Blazor) on top of the review API.
+7. Evaluation: a golden set of tickets; per-field accuracy, silent-error rate, straight-through rate.
 
 ## Build it
 ```bash
@@ -157,6 +172,8 @@ First run provisions `rg-agents-dev-eastus2` with Azure OpenAI and a `chat` depl
 
 ## Step 1: one extraction agent, inside a workflow
 
+> Step 2 replaced `check` with `compare`, so `/tickets/intake` now returns the step 2 shape. The outputs below are from step 1.
+
 A multimodal agent reads a ticket photo into a typed `Ticket` (structured output). A plain C# step flags what a person must check.
 
 ```mermaid
@@ -201,22 +218,23 @@ Why:
 - **Telemetry:** Aspire's `AddChatClient` already traces model calls; adding `UseOpenTelemetry` again doubled every span.
 - Code changes need an `aspire run` restart (a running app keeps serving the old build; we hit a 404 because of that).
 
-## Step 2: a second extractor in parallel (in progress)
+## Step 2: a second extractor in parallel
 
-Fan-out / fan-in: both extractors run at the same time, and `compare` waits for both.
+Fan-out / fan-in: the LLM agent and Document Intelligence read the same image at the same time; `compare` waits for both and checks them field by field.
 
 ```mermaid
 flowchart LR
-    IN([TicketImage]) --> A["extract-llm<br/>agent"]
-    IN --> B["extract-docintel<br/>Document Intelligence"]
-    A --> C["compare<br/>field by field"]
+    IN([TicketImage]) --> S[start]
+    S -->|fan-out| A["extract-llm<br/>agent"]
+    S -->|fan-out| B["extract-docintel<br/>Document Intelligence"]
+    A -->|fan-in barrier| C["compare<br/>plain C#"]
     B --> C
-    C --> CH["check"]
-    CH --> OUT([IntakeResult])
+    C --> OUT([IntakeResult])
 ```
+
 ### 2a: what Document Intelligence reads on a ticket
 
-The AppHost provisions Document Intelligence (S0, local auth disabled, so Entra ID only; same Bicep as RagChat). A temporary endpoint shows the raw output of `prebuilt-layout` with the **KeyValuePairs** add-on (no training):
+The AppHost provisions Document Intelligence (S0, local auth disabled, so Entra ID only; same Bicep as RagChat). In 2a, a temporary endpoint returned the raw output of `prebuilt-layout` with the **KeyValuePairs** add-on (no training):
 
 ```bash
 dotnet add src/TicketIntake/TicketIntake.ApiService package Azure.AI.DocumentIntelligence
@@ -231,3 +249,73 @@ What we learned (ticket-001 had all values right, confidence 0.97 to 0.997):
 - **Confidence is per key-value pair** (how sure DI is that this label goes with this value), and it drops when the ink is faint. That gives us a threshold for review.
 - **DI can't see the signature.** A scribble isn't text, so `Driver Signature` is `null` on both tickets, signed or not. For now the signature comes from the agent only. A custom DI model has a *signature* field type that detects signed / unsigned.
 - **Labels are OCR'd too:** the form says `°F`, DI returned `ºF` (a look-alike character). Mapping by exact label text is brittle, which is one more reason for a custom model, where fields have names I define.
+
+### 2b: Document Intelligence as an extractor
+
+[`DocIntelExtractor`](src/TicketIntake/TicketIntake.ApiService/Tickets/DocIntelExtractor.cs) is an adapter: it maps DI's key-value pairs to the **same `Ticket` record** as the agent, plus DI's confidence per field. Labels are matched by prefix (they're OCR'd too), text that doesn't parse becomes `null` (never guess), and `DriverSigned` is always `null` from DI because layout can't see a signature. Swapping in a custom DI model later only changes this class.
+
+`DriverSigned` became `bool?`: DI can't tell, and `false` would claim "unsigned" when the truth is "unknown".
+
+### 2c: fan-out / fan-in + compare
+
+```bash
+curl -k -F "image=@samples/tickets/ticket-001.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/intake
+```
+```json
+{"ticket":{"ticketNumber":"104732","pickupTime":"2026-10-02T14:45:00","driverName":"J. Martinez","siteCode":"SITE-042","tankNumber":"3","volumeBarrels":162.4,"temperatureF":68,"driverSigned":true},"needsReview":[]}
+```
+```bash
+curl -k -F "image=@samples/tickets/ticket-002.png" https://apiservice-ticketintake.dev.localhost:7561/tickets/intake
+```
+```json
+{"ticket":{"ticketNumber":"104733","pickupTime":"2026-10-03T09:10:00","driverName":"R. Okafor","siteCode":"SITE-017","tankNumber":null,"volumeBarrels":148.75,"temperatureF":null,"driverSigned":false},"needsReview":[{"field":"TankNumber","reason":"extractors disagree","llm":null,"docIntel":"8","docIntelConfidence":0.853},{"field":"TemperatureF","reason":"unreadable","llm":null,"docIntel":null,"docIntelConfidence":0.964},{"field":"DriverSigned","reason":"not signed","llm":false,"docIntel":null,"docIntelConfidence":null}]}
+```
+
+The reviewer gets both readings and DI's confidence for each disputed field. In the trace, `extract-llm` and `extract-docintel` run at the same time.
+
+Read the code in this order:
+1. [`IntakeWorkflow.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/IntakeWorkflow.cs): `AddFanOutEdge` / `AddFanInBarrierEdge`, the executors, and `CompareExecutor`'s rule (agree = accepted; disagree or unreadable = review).
+2. [`DocIntelExtractor.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/DocIntelExtractor.cs): the adapter from DI's output to `Ticket`.
+3. [`Program.cs`](src/TicketIntake/TicketIntake.ApiService/Program.cs) and [`launchSettings.json`](src/TicketIntake/TicketIntake.ApiService/Properties/launchSettings.json): keyless clients; `AZURE_TOKEN_CREDENTIALS=dev` locally.
+
+Why:
+- **Stateful vs shareable executors.** The extractors keep nothing per run, so one instance serves every run (`declareCrossRunShareable: true`, like a singleton). `compare` holds the first reading until the second arrives, so it's registered with a **factory** (`BindExecutor`) and each run gets its own instance (like a scoped service).
+- **Two handlers, no source generator.** The readings arrive as two message types; `compare` declares one handler per type in `ConfigureProtocol` (the `[MessageHandler]` generator isn't in the 1.23.0 package).
+- **Structured output enforces JSON types, not string formats.** One run returned `pickupTime` in a non-ISO format and the step failed; the field's description now spells out the format with an example. One passing run proves little: that's what evaluation (step 6) is for.
+- **`DefaultAzureCredential` tries managed identity first.** On a laptop that probe hung ~75 s per call. `AZURE_TOKEN_CREDENTIALS=dev` in `launchSettings.json` (local runs only) makes it use developer sign-ins only; code stays `new DefaultAzureCredential()`.
+- **Business rules are executors, not tools.** If the code always runs the check (ranges, "tank belongs to site"), it's a plain C# executor. A tool is for when the model decides what to look up (fuzzy driver-name matching). That's step 3.
+
+## Step 3: validate, save, and the review API
+
+```mermaid
+flowchart LR
+    IN([TicketImage]) --> S["start<br/>image → run state"]
+    S -->|fan-out| A["extract-llm"]
+    S -->|fan-out| B["extract-docintel"]
+    A -->|fan-in barrier| C["compare"]
+    B --> C
+    C --> V["validate<br/>TicketRules"]
+    V --> SV["save<br/>TicketStore"]
+    SV --> OUT([StoredTicket])
+```
+
+- **`validate`** runs [`TicketRules`](src/TicketIntake/TicketIntake.ApiService/Tickets/TicketRules.cs) on the agreed values: volume 0-220 bbl, temperature -20 to 140 °F, not in the future, site exists, tank belongs to the site (placeholder reference data).
+- **`save`** stores the ticket: `final` is filled when nothing needs review, otherwise it waits in the inbox. It needs the image, which isn't in the messages between steps, so `start` puts it in the run's **state** (`QueueStateUpdateAsync` under a shared scope) and `save` reads it back.
+- **Review API** ([`TicketEndpoints.cs`](src/TicketIntake/TicketIntake.ApiService/Tickets/TicketEndpoints.cs)): `GET /tickets/reviews` (inbox), `GET /tickets/{id}`, `GET /tickets/{id}/image`, `POST /tickets/{id}/review` (every field filled + the **same `TicketRules`**, then accepted).
+
+```bash
+API=https://apiservice-ticketintake.dev.localhost:7561
+
+curl -sk -F "image=@samples/tickets/ticket-001.png" $API/tickets/intake; echo   # accepted: final is filled
+ID=$(curl -sk -F "image=@samples/tickets/ticket-002.png" $API/tickets/intake | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+curl -sk $API/tickets/reviews; echo                                                 # the inbox: ticket 104733
+
+# A fix that breaks the rules (tank 8 isn't at SITE-017, unsigned) is rejected with reasons
+curl -sk -X POST $API/tickets/$ID/review -H "Content-Type: application/json" \
+  -d '{"ticketNumber":"104733","pickupTime":"2026-10-03T09:10:00","driverName":"R. Okafor","siteCode":"SITE-017","tankNumber":"8","volumeBarrels":148.75,"temperatureF":70,"driverSigned":false}'; echo
+
+# A valid fix is accepted (204) and leaves the inbox
+curl -sk -o /dev/null -w "%{http_code}\n" -X POST $API/tickets/$ID/review -H "Content-Type: application/json" \
+  -d '{"ticketNumber":"104733","pickupTime":"2026-10-03T09:10:00","driverName":"R. Okafor","siteCode":"SITE-017","tankNumber":"4","volumeBarrels":148.75,"temperatureF":70,"driverSigned":true}'
+curl -sk $API/tickets/reviews; echo
+```

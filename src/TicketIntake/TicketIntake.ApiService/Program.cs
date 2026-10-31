@@ -1,4 +1,3 @@
-using Azure;
 using Azure.AI.DocumentIntelligence;
 using Azure.Identity;
 using Microsoft.Extensions.AI;
@@ -9,19 +8,24 @@ var builder = WebApplication.CreateBuilder(args);
 // Add service defaults & Aspire client integrations.
 builder.AddServiceDefaults();
 
-// Azure OpenAI from the AppHost's "openai" connection (keyless, DefaultAzureCredential).
+// Keyless auth everywhere via DefaultAzureCredential: your az/azd sign-in locally, the app's managed identity in Azure.
+// Locally, launchSettings.json sets AZURE_TOKEN_CREDENTIALS=dev, so it skips the managed identity probe (it can hang on a laptop).
+
+// Azure OpenAI from the AppHost's "openai" connection.
 // Registers IChatClient for the "chat" deployment. Aspire already adds OpenTelemetry (one span per model call, token metrics).
 builder.AddAzureOpenAIClient("openai", settings =>
         settings.EnableSensitiveTelemetryData = builder.Environment.IsDevelopment()) // prompts/responses in traces: dev only
     .AddChatClient("chat");
 
-// Document Intelligence (no Aspire client integration, so registered by hand). Entra ID, no keys.
+// Document Intelligence (no Aspire client integration, so registered by hand).
 builder.Services.AddSingleton(_ => new DocumentIntelligenceClient(
     new Uri(builder.Configuration.GetConnectionString("docintel") ?? throw new InvalidOperationException("Missing ConnectionStrings:docintel")),
     new DefaultAzureCredential()));
 
-builder.Services.AddSingleton<TicketExtractor>();
+builder.Services.AddSingleton<TicketExtractor>();   // extractor A: LLM vision agent
+builder.Services.AddSingleton<DocIntelExtractor>(); // extractor B: Document Intelligence
 builder.Services.AddSingleton<IntakeWorkflow>(); // the graph is built once; each request is its own run
+builder.Services.AddSingleton<TicketStore>();    // placeholder: in memory until the database step
 
 // Add services to the container.
 builder.Services.AddProblemDetails();
@@ -47,36 +51,7 @@ app.MapGet("/", () => "API service is running. Navigate to /weatherforecast to s
 app.MapGet("/model-check", async (IChatClient chat) =>
     (await chat.GetResponseAsync("Reply with exactly: model is reachable")).Text);
 
-// Step 2a check: what Document Intelligence reads on a ticket (key-value pairs + confidence), before we map it to a Ticket.
-app.MapPost("/docintel-check", async (IFormFile image, DocumentIntelligenceClient docIntel, CancellationToken cancellationToken) =>
-{
-    using var buffer = new MemoryStream();
-    await image.CopyToAsync(buffer, cancellationToken);
-
-    // prebuilt-layout: OCR + layout, no training. The KeyValuePairs add-on pairs form labels with what's written next to them.
-    AnalyzeDocumentOptions options = new("prebuilt-layout", BinaryData.FromBytes(buffer.ToArray()))
-    {
-        Features = { DocumentAnalysisFeature.KeyValuePairs }
-    };
-    Operation<AnalyzeResult> operation = await docIntel.AnalyzeDocumentAsync(WaitUntil.Completed, options, cancellationToken);
-
-    return operation.Value.KeyValuePairs.Select(kv => new { Key = kv.Key.Content, Value = kv.Value?.Content, kv.Confidence });
-})
-.DisableAntiforgery();
-
-// Upload a ticket photo, run it through the intake workflow, get the result as JSON.
-app.MapPost("/tickets/intake", async (IFormFile image, IntakeWorkflow workflow, CancellationToken cancellationToken) =>
-{
-    // Only images go to the model (untrusted input: check the type before spending tokens on it)
-    if (!image.ContentType.StartsWith("image/"))
-        return Results.BadRequest("Upload an image (PNG or JPEG).");
-
-    using var buffer = new MemoryStream();
-    await image.CopyToAsync(buffer, cancellationToken);
-    IntakeResult result = await workflow.RunAsync(new TicketImage(buffer.ToArray(), image.ContentType), cancellationToken);
-    return Results.Ok(result);
-})
-.DisableAntiforgery(); // called by the Web app and curl, not a browser form, so there's no antiforgery token
+app.MapTicketEndpoints(); // intake + human review (Tickets/TicketEndpoints.cs)
 
 app.MapGet("/weatherforecast", () =>
 {

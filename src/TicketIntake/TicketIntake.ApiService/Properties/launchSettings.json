@@ -7,7 +7,9 @@
       "launchBrowser": false,
       "applicationUrl": "http://localhost:5427",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        // Tells the SDK "this is a dev machine: only try developer sign-ins", so the managed-identity probe never happens
+        "AZURE_TOKEN_CREDENTIALS": "dev"
       }
     },
     "https": {
@@ -16,7 +18,8 @@
       "launchBrowser": false,
       "applicationUrl": "https://localhost:7561;http://localhost:5427",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "AZURE_TOKEN_CREDENTIALS": "dev"
       }
     }
   }
